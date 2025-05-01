@@ -43,6 +43,7 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available
+from transformers.trainer_utils import EvalLoopOutput
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
@@ -76,6 +77,7 @@ if is_wandb_available():
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+EvalFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 
 class RepeatSampler(Sampler):
@@ -361,6 +363,7 @@ class GRPOTrainer(Trainer):
         self,
         model: Union[str, PreTrainedModel],
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        eval_funcs: Union[EvalFunc, list[EvalFunc]] = None,
         args: Optional[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
@@ -455,6 +458,22 @@ class GRPOTrainer(Trainer):
             else:
                 self.reward_func_names.append(reward_funcs[i].__name__)
         self.reward_funcs = reward_funcs
+
+        # Eval functions
+        if eval_funcs is not None:
+            if not isinstance(eval_funcs, list):
+                eval_funcs = [eval_funcs]
+            self.eval_func_names = []
+            for i, eval_func in enumerate(eval_funcs):
+                if isinstance(eval_func, str):
+                    eval_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                        eval_func, num_labels=1, **model_init_kwargs
+                    )
+                if isinstance(eval_funcs[i], nn.Module):  # Use Module over PretrainedModel for compat w/ compiled models
+                    self.eval_func_names.append(eval_funcs[i].config._name_or_path.split("/")[-1])
+                else:
+                    self.eval_func_names.append(eval_funcs[i].__name__)
+        self.eval_funcs = eval_funcs
 
         # Reward weights
         if args.reward_weights is not None:
@@ -1053,6 +1072,8 @@ class GRPOTrainer(Trainer):
                     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    # Add tokenizer
+                    reward_kwargs["tokenizer"] = self.processing_class
                     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
@@ -1258,6 +1279,142 @@ class GRPOTrainer(Trainer):
                 loss = self.compute_loss(model, inputs)
             loss = loss.mean().detach()
         return loss, None, None
+
+    def generate_from_model(self, inputs: list[dict[str, Union[torch.Tensor, Any]]]):
+        """Generate samples from the model for the given dataset."""
+
+        device = self.accelerator.device
+        num_generations = 1
+
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(
+            text=prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # Generate completions using either vLLM or regular generation
+        if self.use_vllm:
+            # First, have main process load weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()
+                self._last_loaded_step = self.state.global_step
+
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            all_prompts_text = gather_object(prompts_text)
+            if self.accelerator.is_main_process:
+                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                # prompt individually.
+                ordered_set_of_prompts = all_prompts_text[:: num_generations]
+                with profiling_context(self, "vLLM.generate"):
+                    completion_ids = self.vllm_client.generate(
+                        prompts=ordered_set_of_prompts,
+                        n=num_generations,
+                        repetition_penalty=self.repetition_penalty,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        top_k=-1 if self.top_k is None else self.top_k,
+                        min_p=0.0 if self.min_p is None else self.min_p,
+                        max_tokens=self.max_completion_length,
+                        guided_decoding_regex=self.guided_decoding_regex,
+                    )
+            else:
+                completion_ids = [None] * len(all_prompts_text)
+            # Broadcast the completions from the main process to all processes, ensuring each process receives its
+            # corresponding slice.
+            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            completion_ids = completion_ids[process_slice]
+
+            # Pad the completions, and concatenate them with the prompts
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        else:
+            # Regular generation path
+            with unwrap_model_for_generation(
+                self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+            ) as unwrapped_model:
+                prompt_completion_ids = unwrapped_model.generate(
+                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                )
+
+            # Compute prompt length and extract completion ids
+            prompt_length = prompt_ids.size(1)
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # Decode the generated completions
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        return prompts, completions
+
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Overriding built-in evaluation loop to store metrics for each batch.
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+
+        if self.eval_funcs is not None:
+            mode = "eval"
+            dataset = dataloader.dataset
+            inputs = self.data_collator(dataset)
+
+            prompts, completions = self.generate_from_model(inputs)
+
+            device = self.accelerator.device
+            evals_per_func = torch.zeros(len(prompts), len(self.eval_funcs), device=device)
+            for i, (eval_func, eval_func_name) in enumerate(
+                zip(self.eval_funcs, self.eval_func_names)
+            ):
+                with profiling_context(self, eval_func_name):
+                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    # print(f"keys: {keys}")
+                    eval_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    output_eval_func = eval_func(prompts=prompts, completions=completions, **eval_kwargs)
+                    # Convert None values to NaN
+                    output_eval_func = [ev if ev is not None else torch.nan for ev in output_eval_func]
+
+                    evals_per_func[:, i] = torch.tensor(output_eval_func, dtype=torch.float32, device=device)
+            # Calculate mean eval per function, but only for samples where the function was applied (non-NaN values)
+            for i, eval_func_name in enumerate(self.eval_func_names):
+                mean_evals = torch.nanmean(evals_per_func[:, i]).item()
+                self._metrics[mode][f"evaluation/{eval_func_name}/mean"].append(mean_evals)
+                std_evals = nanstd(evals_per_func[:, i]).item()
+                self._metrics[mode][f"evaluation/{eval_func_name}/std"].append(std_evals)
+
+        # Base evaluation
+        initial_output = super().evaluation_loop(
+            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
+        )
+
+        return initial_output
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "train" if self.model.training else "eval"
